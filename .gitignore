@@ -1,0 +1,23 @@
+# 输出产物（strm/清单/失败列表）
+*_output/
+strm_*/
+manifest/
+*.strm
+failed_codes.txt
+*_playable_codes.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# wrangler / 本地缓存
+worker/.wrangler/
+node_modules/
+worker/dev.vars
+
+# 敏感文件
+*.env
+.env
+deploy.py

@@ -1,0 +1,36 @@
+# wrangler.toml —— memojavstrm-worker 部署配置
+#
+# 部署步骤：
+#   npm i -g wrangler
+#   export CLOUDFLARE_API_TOKEN=xxx
+#   export CLOUDFLARE_ACCOUNT_ID=59ff4cced38107663a9ee2dd8e83e023
+#   cd worker
+#   wrangler deploy
+#
+# 部署成功后得到短链接：
+#   https://memojavstrm.<你的子域>.workers.dev/<番号>
+# 例如 https://memojavstrm.emby-59f.workers.dev/ROE-552
+
+name = "memojavstrm"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["global_fetch_strictly_public"]
+
+[vars]
+# 上游媒体域名，逗号分隔按顺序探测（只有 video10 可用，预留扩展位）
+MEDIA_HOSTS = "video10.memojav.net"
+# 解析缓存秒数
+CACHE_TTL = "600"
+# 定时健康检查用的番号（逗号分隔）
+HEALTH_CHECK_CODES = "ROE-552,SDNM-561,MIDA-758"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+# 自定义域名（可选）：绑定后可用 https://memojav.你的域名.com/<番号>
+# routes = [
+#   { pattern = "memojav.example.com", custom_domain = true },
+# ]
+
+[observability]
+enabled = true
