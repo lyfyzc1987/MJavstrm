@@ -23,6 +23,7 @@ Emby 媒体库
 | 请求 | 行为 |
 | --- | --- |
 | `GET /<番号>` | **302** 重定向到最新 `master.m3u8`（默认，零流量） |
+| `GET /<番号>?web=1` | **网页播放页**（hls.js + 同源代理，浏览器里直接看画面） |
 | `GET /<番号>?proxy=1` | HLS 反向代理：清单改写为走 Worker，分片透传 Range |
 | `GET /<番号>?refresh=1` | 绕过缓存强制重新解析（验证脚本用，避免旧 404 缓存误判） |
 | `GET /<番号>?json=1` | 返回解析结果 JSON（调试） |
@@ -65,6 +66,27 @@ curl -sI "https://memojavstrm.emby-59f.workers.dev/ROE-552" | head -3   # 期望
 curl -s  "https://memojavstrm.emby-59f.workers.dev/ROE-552?json=1"     # 期望 {"ok":true,...}
 curl -sI "https://memojavstrm.emby-59f.workers.dev/ZZZZ-999" | head -1 # 期望 404
 ```
+
+### 2.1 浏览器里怎么看
+
+**直接把 m3u8 粘到 Chrome 地址栏是播不了的**，这有两个独立原因：
+
+1. **桌面 Chromium（Chrome/Edge）没有原生 HLS 支持** —— 它只认 `<video>` 里的 MP4/WebM。
+   打开 m3u8 只会把清单当纯文本显示，或触发下载。Safari / iOS 原生支持 HLS，能直接播。
+2. **上游不带 CORS 头** —— 实测 `video10.memojav.net` 的清单和分片都没有
+   `access-control-allow-origin`，`OPTIONS` 预检直接返回 403。所以任何跨域页面
+   （包括本项目自己的网页播放页）都**不能**直连上游清单。
+
+因此网页播放页的播放源用的是**同源代理** `?proxy=1`：清单和分片全部经同一个 Worker
+中转，绕开 CORS。桌面端靠 hls.js（多 CDN 自动回退），Safari 走原生 HLS。
+
+```
+浏览器打开  https://memojavstrm.emby-59f.workers.dev/HMN-910?web=1
+```
+
+⚠️ **请求量提醒**：一个番号约 880 个分片，整片走代理 = 约 880 次 Worker 请求。
+Workers 免费额度 100k 请求/天 ≈ 只能支撑 ~110 次「网页全片播放」。
+**网页播放页只用于抽查预览**；Emby / VLC / PotPlayer 请用 302 短链，一跳直达上游、零 Worker 流量。
 
 ## 3. 生成 .strm
 
