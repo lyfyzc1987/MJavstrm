@@ -7,13 +7,21 @@
  *
  * 播放时 Worker 实时解析出真实播放地址：
  *
- *     GET /<番号>              → 302 重定向到 master.m3u8（默认，零流量）
- *     GET /<番号>?proxy=1      → 反向代理 HLS（清单 + 分片全部走 Worker，兜底）
+ *     GET /<番号>              → 302 重定向到第一条真实播放源（默认，零流量）
+ *     GET /<番号>?sources=1    → 返回上游真实播放源列表（HLS / MP4 清晰度）
+ *     GET /<番号>?source=<id>  → 302 重定向到指定播放源
+ *     GET /<番号>?proxy=1      → 反向代理 HLS / MP4（清单 + 分片走 Worker，兜底）
  *     GET /<番号>?refresh=1    → 绕过缓存强制重新解析（验证脚本专用，避免旧 404 缓存误判）
  *     GET /<番号>?json=1       → 返回解析结果 JSON（调试）
  *     GET /<番号>/<分片>?proxy=1&p=1 → 代理模式下的分片/map 转发（透传 Range）
  *
- * 上游（2026-09-12 实测）：
+ * 上游（2026-10-12 实测）：
+ *     https://memojav.org/hls/get_video_info.php?id=<番号>&sig=...&sts=...
+ *   - 这是详情页播放器实际使用的接口，返回 hls 或 mp4；
+ *   - mp4 会原生提供 1080p / 720p / 360p 三条清晰度；
+ *   - hls 上游当前只有一条 master.m3u8，不能伪造出并不存在的清晰度。
+ *
+ * 兼容旧直链探测：
  *     https://video10.memojav.net/stream/<大写番号>/master.m3u8
  *   - 免签直链，**无需 Referer / UA**（比 javstrm 简单，302 模式即可直接播）
  *   - 番号大小写敏感，必须大写；不存在返回 404
@@ -33,6 +41,17 @@ const DEFAULT_HOSTS = ["video10.memojav.net"];
 const DEFAULT_CACHE_TTL = 600;
 // 未命中的负缓存时长（秒），短一点，保证新上架番号能较快出现
 const NEGATIVE_CACHE_TTL = 60;
+const SOURCE_CACHE_VERSION = 2;
+
+const INFO_ORIGIN = "https://memojav.org";
+const INFO_PATH = "/hls/get_video_info.php";
+const INFO_REFERER_PREFIX = "https://memojav.org/embed/";
+
+const MP4_QUALITIES = [
+  { id: "mp4-1080", suffix: "m37", height: 1080, name: "MemoJav 1080P" },
+  { id: "mp4-720", suffix: "m22", height: 720, name: "MemoJav 720P" },
+  { id: "mp4-360", suffix: "m18", height: 360, name: "MemoJav 360P" },
+];
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -61,28 +80,188 @@ function cacheTtl(env) {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_CACHE_TTL;
 }
 
+function includeProxySource(env) {
+  const raw = String((env && env.INCLUDE_PROXY_SOURCE) || "true")
+    .trim()
+    .toLowerCase();
+  return raw !== "false" && raw !== "0" && raw !== "off" && raw !== "no";
+}
+
 /** 规范化番号：去扩展名、去空白、统一大写 */
 function normalizeCode(raw) {
   let code = String(raw || "").trim();
   if (!code) return "";
-  code = decodeURIComponent(code).toUpperCase();
+  try {
+    code = decodeURIComponent(code);
+  } catch {
+    return "";
+  }
+  code = code.toUpperCase();
   code = code.replace(/\.(STRM|MP4|MKV|M3U8|TS)$/, "");
   if (!/^[A-Z0-9][A-Z0-9_.-]{0,63}$/.test(code)) return "";
   if (!/[A-Z0-9]/.test(code)) return "";
   return code;
 }
 
+function base64Encode(value) {
+  if (typeof btoa === "function") return btoa(value);
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(value, "binary").toString("base64");
+  }
+  throw new Error("base64 encoder unavailable");
+}
+
+/**
+ * 复刻上游 /static/main.js 的 video_sig()：
+ *   sig = btoa(timestamp) 的第 8~17 位（共 10 位）
+ *   sts = 1 + Σ(charCode(sig[i]) * i * 1743)
+ */
+export function memoVideoSignature(nowMs = Date.now()) {
+  const encoded = base64Encode(String(nowMs));
+  const sig = encoded.slice(-12, -2);
+  let sts = 1;
+  for (let index = 0; index < sig.length; index += 1) {
+    sts += sig.charCodeAt(index) * index * 1743;
+  }
+  return { sig, sts };
+}
+
+function decodeComponent(value) {
+  try {
+    return decodeURIComponent(String(value || ""));
+  } catch {
+    return String(value || "");
+  }
+}
+
+function hostFromUrl(raw) {
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function hlsSource(url, checkedAt) {
+  return {
+    id: "hls",
+    name: "MemoJav 302",
+    kind: "hls",
+    container: "m3u8",
+    height: 0,
+    url,
+    checkedAt,
+  };
+}
+
+function mp4Sources(baseUrl, checkedAt) {
+  return MP4_QUALITIES.map((quality) => ({
+    id: quality.id,
+    name: quality.name,
+    kind: "mp4",
+    container: "mp4",
+    height: quality.height,
+    url: `${baseUrl}=${quality.suffix}`,
+    checkedAt,
+  }));
+}
+
+export function parseMemoVideoInfo(text, checkedAt = new Date().toISOString()) {
+  const raw = String(text || "").replace(/^\s*for\s*\(;;\);\s*/i, "");
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!payload || payload.success !== true) return null;
+  const type = String(payload.type || "").toLowerCase();
+  const url = decodeComponent(payload.url);
+  if (!url) return null;
+  if (type === "hls") {
+    const source = hlsSource(url, checkedAt);
+    return {
+      ok: true,
+      type: "hls",
+      provider: "memojav-api",
+      host: hostFromUrl(url),
+      url,
+      sources: [source],
+      checkedAt,
+    };
+  }
+  if (type === "mp4") {
+    const sources = mp4Sources(url, checkedAt);
+    return {
+      ok: true,
+      type: "mp4",
+      provider: "memojav-api",
+      host: hostFromUrl(sources[0].url),
+      url: sources[0].url,
+      sources,
+      checkedAt,
+    };
+  }
+  return null;
+}
+
+function addProxyFallback(info, env) {
+  if (!includeProxySource(env) || !info || !info.ok) return info;
+  if (info.type !== "hls" || !Array.isArray(info.sources) || !info.sources.length) {
+    return info;
+  }
+  const primary = info.sources.find((source) => source.id === "hls") || info.sources[0];
+  if (info.sources.some((source) => source.id === "hls-proxy")) return info;
+  info.sources.push({
+    id: "hls-proxy",
+    name: "MemoJav 代理",
+    kind: "hls",
+    container: "m3u8",
+    height: primary.height || 0,
+    url: primary.url,
+    proxy: true,
+    fallback: true,
+    checkedAt: info.checkedAt,
+  });
+  return info;
+}
+
+async function resolveMemoInfo(code, env, fetchImpl = fetch) {
+  const checkedAt = new Date().toISOString();
+  const signature = memoVideoSignature();
+  const infoUrl =
+    `${INFO_ORIGIN}${INFO_PATH}?id=${encodeURIComponent(code)}` +
+    `&sig=${encodeURIComponent(signature.sig)}&sts=${encodeURIComponent(String(signature.sts))}`;
+  try {
+    const response = await fetchImpl(infoUrl, {
+      method: "GET",
+      headers: {
+        "user-agent": UA,
+        accept: "*/*",
+        referer: `${INFO_REFERER_PREFIX}${encodeURIComponent(code)}`,
+      },
+    });
+    if (response.ok) {
+      const info = parseMemoVideoInfo(await response.text(), checkedAt);
+      if (info) return addProxyFallback(info, env);
+    }
+  } catch {
+    // 接口失败时继续走旧版媒体域名探测，保证已上架 HLS 仍可播放。
+  }
+  return null;
+}
+
 /**
  * 探测番号是否存在：逐个候选域名请求 master.m3u8 的前 2KB。
  * 命中返回 { ok:true, host, url }，全部失败返回 { ok:false, status }。
  */
-async function resolveSource(code, env) {
+async function resolveLegacySource(code, env, fetchImpl = fetch) {
   const list = mediaHosts(env);
   let lastStatus = 404;
   for (const host of list) {
     const url = `https://${host}/stream/${code}/master.m3u8`;
     try {
-      const resp = await fetch(url, {
+      const resp = await fetchImpl(url, {
         method: "GET",
         headers: { "user-agent": UA, accept: "*/*", range: "bytes=0-4095" },
       });
@@ -95,7 +274,19 @@ async function resolveSource(code, env) {
         }
         // 必须真的是 HLS 清单，避免把 CDN 的错误页当成命中
         if (/#EXTM3U/i.test(head)) {
-          return { ok: true, host, url, checkedAt: new Date().toISOString() };
+          const checkedAt = new Date().toISOString();
+          return addProxyFallback(
+            {
+              ok: true,
+              type: "hls",
+              provider: "legacy-host",
+              host,
+              url,
+              sources: [hlsSource(url, checkedAt)],
+              checkedAt,
+            },
+            env,
+          );
         }
         lastStatus = 502;
       } else {
@@ -108,13 +299,28 @@ async function resolveSource(code, env) {
   return { ok: false, status: lastStatus };
 }
 
-/** 读/写解析缓存（caches.default），refresh=1 时跳过读 */
-async function resolveCached(code, env, refresh) {
-  const ttl = cacheTtl(env);
-  const cache = caches.default;
-  const key = new Request(`https://memojavstrm.internal/__resolve/${code}`, { method: "GET" });
+export async function resolveSource(code, env, fetchImpl = fetch) {
+  const info = await resolveMemoInfo(code, env, fetchImpl);
+  if (info && info.ok) return info;
+  return resolveLegacySource(code, env, fetchImpl);
+}
 
-  if (!refresh) {
+/** 读/写解析缓存（caches.default），refresh=1 时跳过读 */
+async function resolveCached(code, env, refresh, fetchImpl = fetch) {
+  const ttl = cacheTtl(env);
+  let cache = null;
+  try {
+    cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
+  } catch {
+    cache = null;
+  }
+  const key = new Request(
+    `https://memojavstrm.internal/__resolve/v${SOURCE_CACHE_VERSION}/${code}` +
+      `?proxy=${includeProxySource(env) ? "1" : "0"}`,
+    { method: "GET" },
+  );
+
+  if (!refresh && cache) {
     const hit = await cache.match(key);
     if (hit) {
       try {
@@ -125,20 +331,22 @@ async function resolveCached(code, env, refresh) {
     }
   }
 
-  const info = await resolveSource(code, env);
+  const info = await resolveSource(code, env, fetchImpl);
   const body = JSON.stringify(info);
   const maxAge = info.ok ? ttl : NEGATIVE_CACHE_TTL;
   // 注意：caches.default.put 必须在响应结束后仍可执行，用 ctx 交给运行时
-  const put = cache.put(
-    key,
-    new Response(body, {
-      headers: { "content-type": "application/json", "cache-control": `s-maxage=${maxAge}` },
-    })
-  );
-  if (typeof ctxGlobal !== "undefined" && ctxGlobal && ctxGlobal.waitUntil) {
-    ctxGlobal.waitUntil(put);
-  } else {
-    await put;
+  if (cache) {
+    const put = cache.put(
+      key,
+      new Response(body, {
+        headers: { "content-type": "application/json", "cache-control": `s-maxage=${maxAge}` },
+      })
+    );
+    if (typeof ctxGlobal !== "undefined" && ctxGlobal && ctxGlobal.waitUntil) {
+      ctxGlobal.waitUntil(put);
+    } else {
+      await put;
+    }
   }
   return info;
 }
@@ -146,7 +354,7 @@ async function resolveCached(code, env, refresh) {
 let ctxGlobal = null;
 
 /** 把清单里的相对 URI 改写成走本 Worker 代理的绝对 URL */
-function rewritePlaylist(text, code, origin) {
+function rewritePlaylist(text, code, origin, sourceId = "") {
   const base = `${origin}/${code}`;
   const fix = (raw) => {
     if (!raw) return raw;
@@ -159,7 +367,8 @@ function rewritePlaylist(text, code, origin) {
       .split("/")
       .map((seg) => encodeURIComponent(seg))
       .join("/");
-    return `${base}/${proxied}?proxy=1&p=1`;
+    const sourceQuery = sourceId ? `&source=${encodeURIComponent(sourceId)}` : "";
+    return `${base}/${proxied}?proxy=1&p=1${sourceQuery}`;
   };
   return text
     .split(/\r?\n/)
@@ -176,14 +385,14 @@ function rewritePlaylist(text, code, origin) {
 }
 
 /** 代理转发（透传 Range，保留 200/206），用于分片与兜底清单 */
-async function proxyFetch(target, request) {
+async function proxyFetch(target, request, fetchImpl = fetch) {
   const headers = {
     "user-agent": request.headers.get("user-agent") || UA,
     accept: request.headers.get("accept") || "*/*",
   };
   const range = request.headers.get("range");
   if (range) headers.range = range;
-  const up = await fetch(target, { method: "GET", headers });
+  const up = await fetchImpl(target, { method: "GET", headers });
   const out = new Headers(up.headers);
   out.set("cache-control", "no-store");
   out.set("access-control-allow-origin", "*");
@@ -237,8 +446,11 @@ const PAGE_HEAD = `<meta charset="utf-8">
  * 桌面 Chromium 无原生 HLS，靠 hls.js；Safari/iOS 走原生 HLS。
  */
 function playerHtml(code, origin, upstream) {
-  const src = `${origin}/${code}?proxy=1`;
+  const sourceId = upstream && upstream.id ? upstream.id : "";
+  const sourceQuery = sourceId ? `&source=${encodeURIComponent(sourceId)}` : "";
+  const src = `${origin}/${code}?proxy=1${sourceQuery}`;
   const short = `${origin}/${code}`;
+  const isMp4 = upstream && upstream.kind === "mp4";
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -255,13 +467,13 @@ ${PAGE_HEAD}
   <div class="bar">
     <button class="btn" id="cp">复制 302 短链</button>
     <a class="btn" href="${short}" target="_blank" rel="noreferrer">302 短链（给外部播放器）</a>
-    <a class="btn" href="${src}" target="_blank" rel="noreferrer">原始 m3u8</a>
+    <a class="btn" href="${src}" target="_blank" rel="noreferrer">代理播放源</a>
     <a class="btn" href="/">接口说明</a>
   </div>
   <div class="note">
     <div>· 本页播放走同源代理 <code>?proxy=1</code>，清单与分片经 Cloudflare Worker 中转（网页预览专用）。</div>
     <div>· Emby / VLC / PotPlayer 请用 302 短链 <code>${short}</code>，一跳直达上游、零 Worker 流量。</div>
-    <div>· 上游清单 <code>${upstream}</code> 不带 CORS 头，浏览器无法直连，故本页必须走同源代理。</div>
+    <div>· 上游地址 <code>${upstream && upstream.url ? upstream.url : "unknown"}</code> 不带 CORS 头，浏览器无法直连，故本页必须走同源代理。</div>
     <div>· 桌面端 HLS 依赖 hls.js（多 CDN 自动回退）；Safari / iOS 走原生 HLS 可直开。</div>
   </div>
 </div>
@@ -271,7 +483,7 @@ var v=document.getElementById('v'), st=document.getElementById('st');
 function say(m){ st.innerHTML=m; st.className='status err'; }
 function hide(){ st.className='status hide'; }
 function start(Hls){
-  if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  if (${isMp4 ? "true" : "v.canPlayType('application/vnd.apple.mpegurl')"}) {
     v.src=SRC;
     v.addEventListener('loadedmetadata', hide);
     v.addEventListener('error', function(){ say('原生 HLS 播放失败，请改用 302 短链在 VLC / PotPlayer 里打开。'); });
@@ -351,8 +563,41 @@ function errorHtml(code, status) {
 </html>`;
 }
 
+function sourceListPayload(info, code) {
+  return {
+    ok: true,
+    code,
+    type: info.type,
+    provider: info.provider,
+    checkedAt: info.checkedAt,
+    sources: (info.sources || []).map((source) => ({
+      id: source.id,
+      name: source.name,
+      kind: source.kind,
+      container: source.container,
+      height: source.height || 0,
+      url: source.url,
+      proxy: Boolean(source.proxy),
+      fallback: Boolean(source.fallback),
+    })),
+  };
+}
+
+function selectSource(info, requested) {
+  const sources = Array.isArray(info && info.sources) ? info.sources : [];
+  if (!sources.length) return null;
+  const raw = String(requested || "").trim().toLowerCase();
+  if (!raw) return sources[0];
+  return (
+    sources.find((source) => String(source.id || "").toLowerCase() === raw) ||
+    sources.find((source) => String(source.height || "") === raw) ||
+    sources.find((source) => String(source.name || "").toLowerCase() === raw) ||
+    sources[0]
+  );
+}
+
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env, ctx, fetchImpl = globalThis.fetch) {
     ctxGlobal = ctx;
     const url = new URL(request.url);
 
@@ -369,14 +614,20 @@ export default {
         ok: true,
         service: "memojavstrm",
         usage: {
-          "GET /<番号>": "302 重定向到最新 m3u8 直链（默认，零流量）",
+          "GET /<番号>": "302 重定向到第一条真实播放源（默认，零流量）",
+          "GET /<番号>?sources=1": "返回上游真实播放源列表（HLS / MP4 清晰度）",
+          "GET /<番号>?source=<id>": "302 重定向到指定播放源",
           "GET /<番号>?web=1": "网页播放页（hls.js 同源代理播放，浏览器直接看）",
-          "GET /<番号>?proxy=1": "HLS 反向代理（清单+分片走 Worker）",
+          "GET /<番号>?proxy=1": "反向代理播放源（HLS 清单+分片或 MP4）",
           "GET /<番号>?refresh=1": "绕过缓存强制重新解析",
           "GET /<番号>?json=1": "返回解析结果 JSON",
         },
         example: `${url.origin}/ROE-552`,
-        upstream: hosts.map((h) => `https://${h}/stream/<番号>/master.m3u8`),
+        upstream: {
+          info: `${INFO_ORIGIN}${INFO_PATH}`,
+          legacy: hosts.map((h) => `https://${h}/stream/<番号>/master.m3u8`),
+        },
+        include_proxy_source: includeProxySource(env),
         cache_ttl_seconds: cacheTtl(env),
       });
     }
@@ -390,9 +641,12 @@ export default {
     const refresh = url.searchParams.get("refresh") === "1";
     const asJson = url.searchParams.get("json") === "1";
     const web = url.searchParams.get("web") === "1";
+    const asSources = url.searchParams.get("sources") === "1";
+    const requestedSource =
+      url.searchParams.get("source") || url.searchParams.get("quality") || "";
 
     // ---- 1. 解析（带缓存） ----
-    const info = await resolveCached(code, env, refresh);
+    const info = await resolveCached(code, env, refresh, fetchImpl);
 
     if (!info || !info.ok) {
       const status = info && info.status === 502 ? 502 : 404;
@@ -406,33 +660,51 @@ export default {
         status
       );
     }
+    const selected = selectSource(info, requestedSource);
+    if (!selected) {
+      return json({ error: "没有可用播放源", code }, 502);
+    }
 
-    // ---- 2. 代理模式下的分片/map 转发 ----
+    // ---- 2. 返回结构化源列表（供 Emby / 客户端生成多个 MediaSource） ----
+    if (asSources) {
+      return json(sourceListPayload(info, code));
+    }
+
+    // ---- 3. 代理模式下的分片/map 转发 ----
     if (proxy && segment) {
       const target = `https://${info.host}/stream/${code}/${segment}`;
-      return proxyFetch(target, request);
+      return proxyFetch(target, request, fetchImpl);
     }
 
-    // ---- 3. 调试 JSON ----
+    // ---- 4. 调试 JSON ----
     if (asJson) {
-      return json({ ok: true, code, host: info.host, url: info.url, proxy });
+      return json({
+        ...sourceListPayload(info, code),
+        host: info.host,
+        url: selected.url,
+        selectedSourceId: selected.id,
+        proxy,
+      });
     }
 
-    // ---- 3b. 网页播放页（浏览器直接看；走同源 ?proxy=1，规避上游无 CORS 头的问题） ----
+    // ---- 5. 网页播放页（浏览器直接看；走同源 ?proxy=1，规避上游无 CORS 头的问题） ----
     if (web) {
-      return html(playerHtml(code, url.origin, info.url));
+      return html(playerHtml(code, url.origin, selected));
     }
 
-    // ---- 4. 代理模式：拉清单并改写为走本 Worker ----
+    // ---- 6. 代理模式：HLS 拉清单并改写；MP4 直接透传 ----
     if (proxy) {
-      const up = await fetch(info.url, {
+      if (selected.kind === "mp4" || selected.container === "mp4") {
+        return proxyFetch(selected.url, request, fetchImpl);
+      }
+      const up = await fetchImpl(selected.url, {
         headers: { "user-agent": request.headers.get("user-agent") || UA },
       });
       if (!up.ok) {
         return json({ error: "上游清单拉取失败", code, status: up.status }, 502);
       }
       const text = await up.text();
-      const rewritten = rewritePlaylist(text, code, url.origin);
+      const rewritten = rewritePlaylist(text, code, url.origin, selected.id);
       return new Response(rewritten, {
         status: 200,
         headers: {
@@ -443,11 +715,24 @@ export default {
       });
     }
 
-    // ---- 5. 默认模式：302 零流量重定向 ----
+    // ---- 7. 默认模式：302 零流量重定向 ----
+    if (selected.proxy) {
+      const proxyUrl = new URL(`${url.origin}/${encodeURIComponent(code)}`);
+      proxyUrl.searchParams.set("proxy", "1");
+      proxyUrl.searchParams.set("source", selected.id);
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: proxyUrl.toString(),
+          "cache-control": "no-store",
+          "access-control-allow-origin": "*",
+        },
+      });
+    }
     return new Response(null, {
       status: 302,
       headers: {
-        location: info.url,
+        location: selected.url,
         "cache-control": `s-maxage=${cacheTtl(env)}`,
         "access-control-allow-origin": "*",
       },

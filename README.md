@@ -1,7 +1,7 @@
 # MemoJavstrm
 
-给 MemoJav 番号一个**永不过期的短链接**，.strm 里只写这个短链接，真实播放地址由
-Cloudflare Worker 在每次访问时实时解析。
+给 MemoJav 番号一个**永不过期的短链接**，.strm 里只写这个短链接，真实播放地址和
+全部播放源由 Cloudflare Worker 在访问时实时解析。
 
 架构与 [javstrm](https://github.com/bbemby/javstrm) 完全一致：
 
@@ -10,11 +10,18 @@ Emby 媒体库
   └── ROE-552.strm            ← 内容只有一行：
         https://memojavstrm.emby-59f.workers.dev/ROE-552
                     │
-                    ▼  播放时 Worker 实时解析
+                    ▼  播放时 Worker 调用 info API 实时解析
         https://video10.memojav.net/stream/ROE-552/master.m3u8
 ```
 
 好处：上游直链/域名变了只改 Worker，几万个 `.strm` 不用重写。
+
+多源规则：
+
+- MP4 资源会返回上游真实的 `1080P / 720P / 360P` 三条清晰度。
+- HLS 上游当前只提供一条 `master.m3u8`，因此只返回一条真实线路，不会伪造清晰度；
+  默认另加一条明确标注的 `MemoJav 代理` 兜底线路。
+- 默认短链仍只返回第一条真实源的 **302**，清单和分片不经过 Worker，保持零流量。
 
 ---
 
@@ -22,9 +29,11 @@ Emby 媒体库
 
 | 请求 | 行为 |
 | --- | --- |
-| `GET /<番号>` | **302** 重定向到最新 `master.m3u8`（默认，零流量） |
+| `GET /<番号>` | **302** 重定向到第一条真实播放源（默认，零流量） |
+| `GET /<番号>?sources=1` | 返回全部真实播放源（HLS / MP4 清晰度） |
+| `GET /<番号>?source=<id>` | 302 重定向到指定播放源，如 `mp4-720` |
 | `GET /<番号>?web=1` | **网页播放页**（hls.js + 同源代理，浏览器里直接看画面） |
-| `GET /<番号>?proxy=1` | HLS 反向代理：清单改写为走 Worker，分片透传 Range |
+| `GET /<番号>?proxy=1` | 反向代理：HLS 清单改写为走 Worker，MP4 与分片透传 Range |
 | `GET /<番号>?refresh=1` | 绕过缓存强制重新解析（验证脚本用，避免旧 404 缓存误判） |
 | `GET /<番号>?json=1` | 返回解析结果 JSON（调试） |
 | `GET /<番号>/<分片>?proxy=1&p=1` | 代理模式下的分片 / `init.mp4` 转发 |
@@ -32,9 +41,22 @@ Emby 媒体库
 
 - 番号大小写不敏感（内部统一大写），可带 `.strm` 等扩展名。
 - 解析结果缓存 `CACHE_TTL` 秒（默认 600）；未命中的负缓存 60 秒，保证新上架番号能较快出现。
+- `INCLUDE_PROXY_SOURCE=false` 可关闭 HLS 的代理兜底线路，只保留上游真实源。
 - 每 15 分钟 cron 健康检查一次（`HEALTH_CHECK_CODES`）。
 
-### 上游事实（2026-09-12 实测）
+### 上游事实（2026-10-12 实测）
+
+详情页播放器实际调用：
+
+```
+https://memojav.org/hls/get_video_info.php?id=<番号>&sig=...&sts=...
+```
+
+- 响应可能带 `for (;;);` 前缀，`type` 为 `hls` 或 `mp4`。
+- MP4 返回同一地址的三档真实清晰度：`=m37`（1080P）、`=m22`（720P）、`=m18`（360P）。
+- HLS 返回一条 `master.m3u8`；Worker 不把它拆成虚假的 1080P / 720P。
+
+兼容旧直链探测：
 
 ```
 https://video10.memojav.net/stream/<大写番号>/master.m3u8
@@ -62,9 +84,11 @@ wrangler deploy
 自测：
 
 ```bash
-curl -sI "https://memojavstrm.emby-59f.workers.dev/ROE-552" | head -3   # 期望 302 + location
-curl -s  "https://memojavstrm.emby-59f.workers.dev/ROE-552?json=1"     # 期望 {"ok":true,...}
-curl -sI "https://memojavstrm.emby-59f.workers.dev/ZZZZ-999" | head -1 # 期望 404
+curl -sI "https://memojavstrm.emby-59f.workers.dev/ROE-552" | head -3       # 期望 302 + location
+curl -s  "https://memojavstrm.emby-59f.workers.dev/ROE-552?sources=1"       # 期望全部真实播放源
+curl -sI "https://memojavstrm.emby-59f.workers.dev/ROE-552?source=mp4-720"  # MP4 资源时 302 到 720P
+curl -s  "https://memojavstrm.emby-59f.workers.dev/ROE-552?json=1"           # 期望 {"ok":true,...}
+curl -sI "https://memojavstrm.emby-59f.workers.dev/ZZZZ-999" | head -1      # 期望 404
 ```
 
 ### 2.1 浏览器里怎么看
@@ -78,7 +102,8 @@ curl -sI "https://memojavstrm.emby-59f.workers.dev/ZZZZ-999" | head -1 # 期望 
    （包括本项目自己的网页播放页）都**不能**直连上游清单。
 
 因此网页播放页的播放源用的是**同源代理** `?proxy=1`：清单和分片全部经同一个 Worker
-中转，绕开 CORS。桌面端靠 hls.js（多 CDN 自动回退），Safari 走原生 HLS。
+中转，绕开 CORS。页面会携带当前选中的 `source=<id>`，MP4 清晰度也能正确透传。
+桌面端靠 hls.js（多 CDN 自动回退），Safari 走原生 HLS。
 
 ```
 浏览器打开  https://memojavstrm.emby-59f.workers.dev/HMN-910?web=1

@@ -21,6 +21,8 @@ compatibility_flags = ["global_fetch_strictly_public"]
 MEDIA_HOSTS = "video10.memojav.net"
 # 解析缓存秒数
 CACHE_TTL = "600"
+# 是否附加 HLS 代理兜底源；设为 "false" 时只保留上游真实源
+INCLUDE_PROXY_SOURCE = "true"
 # 定时健康检查用的番号（逗号分隔）
 HEALTH_CHECK_CODES = "ROE-552,SDNM-561,MIDA-758"
 
